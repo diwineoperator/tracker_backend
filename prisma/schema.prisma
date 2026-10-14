@@ -1,0 +1,291 @@
+// Daily Time Ledger — data model.
+//
+// A member retrospectively logs time against a fixed category. The server is
+// authoritative for "now": each entry's window is [previous tracker's tracker_time
+// (or local midnight, for the day's first entry), tracker_time]. Whatever part of
+// that window the entry's own duration doesn't cover becomes a second GAP ledger
+// row — the member's chosen gapCategory, or BASE if they didn't pick one. Closing
+// a day books whatever is still left of that day's 1440 minutes as BASE too.
+//
+// Invariants Prisma cannot express are enforced in migration SQL:
+//   - duration_minutes > 0 (CHECK, both tables)
+//   - gap_minutes >= 0 (CHECK, time_tracker)
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "cjs"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum TrackerCategory {
+  WORK
+  SLEEP
+  HEALTH
+  PERSONAL
+  ENTERTAINMENT
+  LEARNING
+  OTHER
+  /// Time not explicitly categorized by the member — an intra-day gap between two
+  /// trackers, or whatever is left of the day at closing. Never chosen as a
+  /// tracker's own primary category, only ever as a GAP ledger entry's category.
+  BASE
+}
+
+enum LedgerEntryType {
+  /// Mirrors a tracker entry the member actually submitted.
+  TRACKER
+  /// Time between two trackers (or, at day close, the rest of the day) that the
+  /// member did not explicitly account for.
+  GAP
+}
+
+/// A department leader is a member row with role ADMIN (at most one per department).
+enum MemberRole {
+  MEMBER
+  ADMIN
+}
+
+enum RequestStatus {
+  OPEN
+  IN_PROGRESS
+  DONE
+  DECLINED
+}
+
+enum TaskStatus {
+  TODO
+  IN_PROGRESS
+  DONE
+}
+
+/// An organisational unit (Fintech, Studio/Investment, …). Members and tasks belong to one.
+model Department {
+  id        String   @id @default(uuid(7)) @db.Uuid
+  name      String   @unique @db.VarChar(100)
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  /// The Admin who leads this department (at most one; an Admin leads at most one).
+  leaderId String? @unique @map("leader_id") @db.Uuid
+  leader   Member? @relation("DepartmentLeader", fields: [leaderId], references: [id], onDelete: SetNull)
+
+  memberships MemberDepartment[]
+  tasks       Task[]
+  requests    DepartmentRequest[]
+
+  @@map("departments")
+}
+
+/// Work an admin assigns to one member of a department. A member logs time against
+/// it through the normal Time Tracker flow (time_tracker.task_id) — the ledger maths
+/// never looks at tasks.
+model Task {
+  id             String     @id @default(uuid(7)) @db.Uuid
+  title          String     @db.VarChar(200)
+  description    String?    @db.VarChar(1000)
+  departmentId   String     @map("department_id") @db.Uuid
+  memberId       String     @map("assigned_member_id") @db.Uuid
+  status         TaskStatus @default(TODO)
+  dueDate        DateTime?  @map("due_date") @db.Date
+  /// When the task was last marked Done (cleared if it is reopened).
+  completedAt    DateTime?  @map("completed_at") @db.Timestamptz(3)
+  /// Set while the member's stopwatch is running on this task (at most one per member —
+  /// a partial unique index in the migration). Never read by the ledger maths.
+  timerStartedAt DateTime?  @map("timer_started_at") @db.Timestamptz(3)
+  /// The admin's sign-in name (the single admin lives in the environment, not in `members`).
+  createdBy      String     @map("created_by") @db.VarChar(100)
+  /// When the task reached its current member — set on creation and again whenever it is reassigned. Drives the
+  /// member's "new for you" badge (a status change or a stopwatch tick must not look like a new assignment).
+  assignedAt     DateTime   @default(now()) @map("assigned_at") @db.Timestamptz(3)
+  createdAt      DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  department     Department         @relation(fields: [departmentId], references: [id], onDelete: Restrict)
+  member         Member             @relation(fields: [memberId], references: [id], onDelete: Restrict)
+  trackerEntries TimeTrackerEntry[]
+
+  @@index([memberId, status], map: "tasks_assigned_member_id_status_idx")
+  @@index([departmentId], map: "tasks_department_id_idx")
+  @@map("tasks")
+}
+
+/// A member account. The single admin is NOT stored here — it comes from the
+/// environment — so this table only ever holds members.
+model Member {
+  id           String     @id @default(uuid(7)) @db.Uuid
+  /// Always lower-case (enforced by a CHECK in the migration).
+  username     String     @unique @db.VarChar(100)
+  fullName     String     @map("full_name") @db.VarChar(200)
+  /// bcrypt hash. Plaintext passwords are never stored.
+  passwordHash String     @map("password_hash") @db.VarChar(100)
+  isActive     Boolean    @default(true) @map("is_active")
+  createdAt    DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
+  /// ADMIN = the leader of the department in `ledDepartment` (the super admin is not a row here — it lives in the environment).
+  role         MemberRole @default(MEMBER)
+
+  tasks              Task[]
+  timeTrackerEntries TimeTrackerEntry[]
+  timeLedgerEntries  TimeLedgerEntry[]
+  dailyClosures      DailyClosure[]
+  sentRequests       DepartmentRequest[]
+  /// A MEMBER belongs to 1..2 departments (max enforced in the API and by a trigger). An ADMIN has none — they lead one.
+  memberships        MemberDepartment[]
+  ledDepartment      Department?         @relation("DepartmentLeader")
+
+  @@map("members")
+}
+
+/// What the member actually submitted: a category, an optional subcategory/comment,
+/// and a duration. `previousTrackerTime`/`trackerTime` are the server-clock window
+/// this entry was checked against; `gapMinutes` is whatever part of that window the
+/// duration didn't cover (booked separately as a GAP TimeLedgerEntry when > 0).
+model TimeTrackerEntry {
+  id                  String          @id @default(uuid(7)) @db.Uuid
+  memberId            String          @map("member_id") @db.Uuid
+  /// Local calendar day (in the server's configured timezone) this entry belongs to.
+  date                DateTime        @db.Date
+  category            TrackerCategory
+  subcategory         String?         @db.VarChar(100)
+  comment             String?         @db.VarChar(500)
+  durationMinutes     Int             @map("duration_minutes")
+  previousTrackerTime DateTime        @map("previous_tracker_time") @db.Timestamptz(3)
+  trackerTime         DateTime        @map("tracker_time") @db.Timestamptz(3)
+  gapMinutes          Int             @map("gap_minutes")
+  createdAt           DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+  /// Set only when an admin or the owning member edits the entry afterward.
+  updatedAt           DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
+  /// Optional: the assigned task this time was logged against. Never affects the ledger maths.
+  taskId              String?         @map("task_id") @db.Uuid
+
+  member        Member            @relation(fields: [memberId], references: [id])
+  task          Task?             @relation(fields: [taskId], references: [id], onDelete: Restrict)
+  ledgerEntries TimeLedgerEntry[]
+
+  @@index([memberId, date], map: "time_tracker_member_id_date_idx")
+  @@map("time_tracker")
+}
+
+/// Where the member's day actually went: one row per TRACKER entry, plus one more
+/// GAP row whenever a tracker (or day closing) left part of its window unaccounted
+/// for. This is what daily totals/remaining-time are computed from.
+model TimeLedgerEntry {
+  id              String          @id @default(uuid(7)) @db.Uuid
+  memberId        String          @map("member_id") @db.Uuid
+  /// Null for a day-closing GAP row — it isn't tied to any one tracker submission.
+  trackerId       String?         @map("tracker_id") @db.Uuid
+  date            DateTime        @db.Date
+  category        TrackerCategory
+  subcategory     String?         @db.VarChar(100)
+  durationMinutes Int             @map("duration_minutes")
+  entryType       LedgerEntryType @map("entry_type")
+  createdAt       DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  member  Member            @relation(fields: [memberId], references: [id])
+  tracker TimeTrackerEntry? @relation(fields: [trackerId], references: [id])
+
+  @@index([memberId, date], map: "time_ledger_member_id_date_idx")
+  @@map("time_ledger")
+}
+
+/// Presence of a row = that member's local day is closed (day-closing is idempotent:
+/// once closed, no more trackers and no second BASE-remainder booking for that day).
+model DailyClosure {
+  id       String   @id @default(uuid(7)) @db.Uuid
+  memberId String   @map("member_id") @db.Uuid
+  date     DateTime @db.Date
+  closedAt DateTime @default(now()) @map("closed_at") @db.Timestamptz(3)
+
+  member Member @relation(fields: [memberId], references: [id])
+
+  @@unique([memberId, date], map: "daily_closure_member_id_date_key")
+  @@map("daily_closure")
+}
+
+/// A member's request/message to the leader of ANOTHER department. The leader (and the
+/// super admin) can read it, change its status and reply.
+model DepartmentRequest {
+  id             String        @id @default(uuid(7)) @db.Uuid
+  fromMemberId   String        @map("from_member_id") @db.Uuid
+  toDepartmentId String        @map("to_department_id") @db.Uuid
+  subject        String        @db.VarChar(200)
+  message        String        @db.VarChar(2000)
+  status         RequestStatus @default(OPEN)
+  response       String?       @db.VarChar(1000)
+  createdAt      DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  fromMember   Member              @relation(fields: [fromMemberId], references: [id], onDelete: Cascade)
+  toDepartment Department          @relation(fields: [toDepartmentId], references: [id], onDelete: Cascade)
+  attachments  RequestAttachment[]
+  messages     RequestMessage[]
+
+  @@index([toDepartmentId, status], map: "department_requests_to_department_id_status_idx")
+  @@index([fromMemberId], map: "department_requests_from_member_id_idx")
+  @@map("department_requests")
+}
+
+/// A message in a request's ongoing conversation, AFTER the original ask (`message`) and the
+/// leader's first reply (`response`) — either side can keep adding to it from there. Immutable:
+/// nothing here is ever edited or deleted, only appended to, so `author_name` is the sender's
+/// name AT THE TIME (like a chat log), not resolved fresh on every read.
+model RequestMessage {
+  id         String   @id @default(uuid(7)) @db.Uuid
+  requestId  String   @map("request_id") @db.Uuid
+  /// 'member' | 'admin' | 'super_admin' — who sent it.
+  authorRole String   @map("author_role") @db.VarChar(20)
+  authorName String   @map("author_name") @db.VarChar(200)
+  body       String   @db.VarChar(2000)
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  request DepartmentRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+
+  @@index([requestId], map: "request_messages_request_id_idx")
+  @@map("request_messages")
+}
+
+/// Which side of a request a file belongs to: what the member sent, or what the leader answered with.
+enum AttachmentKind {
+  REQUEST
+  REPLY
+}
+
+/// A file attached to a request or to its reply. Only metadata lives here — the bytes are in the file store,
+/// under `storage_key` (a server-generated key, never anything the client chose).
+model RequestAttachment {
+  id             String         @id @default(uuid(7)) @db.Uuid
+  requestId      String         @map("request_id") @db.Uuid
+  kind           AttachmentKind
+  fileName       String         @map("file_name") @db.VarChar(200)
+  contentType    String         @map("content_type") @db.VarChar(150)
+  sizeBytes      Int            @map("size_bytes")
+  storageKey     String         @unique @map("storage_key") @db.VarChar(120)
+  /// Sign-in name of whoever uploaded it (the super admin lives in the environment, not in `members`).
+  uploadedBy     String         @map("uploaded_by") @db.VarChar(100)
+  uploadedByRole String         @map("uploaded_by_role") @db.VarChar(20)
+  createdAt      DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  request DepartmentRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+
+  @@index([requestId], map: "request_attachments_request_id_idx")
+  @@map("request_attachments")
+}
+
+/// A member's membership of a department. A member belongs to 1..2 departments.
+model MemberDepartment {
+  memberId     String   @map("member_id") @db.Uuid
+  departmentId String   @map("department_id") @db.Uuid
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  member     Member     @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  department Department @relation(fields: [departmentId], references: [id], onDelete: Cascade)
+
+  @@id([memberId, departmentId])
+  @@index([departmentId])
+  @@map("member_departments")
+}

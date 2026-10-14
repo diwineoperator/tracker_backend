@@ -1,0 +1,17 @@
+node_modules/
+dist/
+coverage/
+
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+
+# Generated Prisma client (rebuilt by `npm run db:generate` / `npm run build`)
+src/generated/
+
+# Uploaded attachment files
+uploads/
+
+*.log
+.DS_Store
