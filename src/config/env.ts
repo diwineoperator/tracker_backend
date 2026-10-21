@@ -33,10 +33,18 @@ const envSchema = z.object({
   /** Where attachment files are kept on disk (relative to the backend folder). */
   UPLOAD_DIR: z.string().trim().min(1).default('uploads'),
 
+  /** Set S3_BUCKET_NAME to store attachments in S3 instead of UPLOAD_DIR. Credentials come from the instance role. */
+  AWS_REGION: z.string().trim().min(1).optional(),
+  S3_BUCKET_NAME: z.string().trim().min(1).optional(),
+  S3_UPLOAD_PREFIX: z.string().trim().default('uploads/'),
+
   TIMEZONE: z
     .string()
     .default('Asia/Kolkata')
     .refine(isValidTimezone, 'must be a valid IANA timezone, e.g. Asia/Kolkata'),
+}).refine((env) => !env.S3_BUCKET_NAME || env.AWS_REGION, {
+  message: 'is required when S3_BUCKET_NAME is set',
+  path: ['AWS_REGION'],
 });
 
 export type Env = Omit<z.infer<typeof envSchema>, 'CORS_ORIGINS'> & {

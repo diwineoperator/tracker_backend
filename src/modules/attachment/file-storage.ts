@@ -1,3 +1,10 @@
+import {
+  DeleteObjectCommand,
+  GetObjectCommand,
+  NoSuchKey,
+  PutObjectCommand,
+  S3Client,
+} from '@aws-sdk/client-s3';
 import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -45,5 +52,57 @@ export class LocalFileStorage implements FileStorage {
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
     }
+  }
+}
+
+/**
+ * Objects in one S3 bucket, under `<prefix><key>`. Credentials come from the default
+ * AWS provider chain (the EC2 instance role in production) — never from config.
+ */
+export class S3FileStorage implements FileStorage {
+  private readonly client: S3Client;
+
+  constructor(
+    region: string,
+    private readonly bucket: string,
+    private readonly prefix: string,
+  ) {
+    this.client = new S3Client({ region });
+  }
+
+  private objectKey(key: string) {
+    assertKey(key);
+    return `${this.prefix}${key}`;
+  }
+
+  async put(key: string, data: Buffer) {
+    await this.client.send(
+      new PutObjectCommand({
+        Bucket: this.bucket,
+        Key: this.objectKey(key),
+        Body: data,
+        // Never overwrite, like the local `wx` flag.
+        IfNoneMatch: '*',
+      }),
+    );
+  }
+
+  async get(key: string) {
+    try {
+      const res = await this.client.send(
+        new GetObjectCommand({ Bucket: this.bucket, Key: this.objectKey(key) }),
+      );
+      if (!res.Body) return null;
+      return Buffer.from(await res.Body.transformToByteArray());
+    } catch (err) {
+      if (err instanceof NoSuchKey) return null;
+      throw err;
+    }
+  }
+
+  async remove(key: string) {
+    await this.client.send(
+      new DeleteObjectCommand({ Bucket: this.bucket, Key: this.objectKey(key) }),
+    );
   }
 }

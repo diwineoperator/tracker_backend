@@ -4,7 +4,7 @@ import { checkDatabase, createDatabase } from './config/database';
 import { loadEnv } from './config/env';
 import path from 'node:path';
 import { PrismaAttachmentRepository } from './modules/attachment/attachment.repository';
-import { LocalFileStorage } from './modules/attachment/file-storage';
+import { LocalFileStorage, S3FileStorage } from './modules/attachment/file-storage';
 import { PrismaDepartmentRepository } from './modules/department/department.repository';
 import { PrismaMemberRepository } from './modules/member/member.repository';
 import { PrismaRequestRepository } from './modules/request/request.repository';
@@ -35,7 +35,9 @@ async function main() {
     taskRepository: new PrismaTaskRepository(db),
     requestRepository: new PrismaRequestRepository(db),
     attachmentRepository: new PrismaAttachmentRepository(db),
-    fileStorage: new LocalFileStorage(path.resolve(env.UPLOAD_DIR)),
+    fileStorage: env.S3_BUCKET_NAME
+      ? new S3FileStorage(env.AWS_REGION!, env.S3_BUCKET_NAME, env.S3_UPLOAD_PREFIX)
+      : new LocalFileStorage(path.resolve(env.UPLOAD_DIR)),
     timeTrackerRepository: new PrismaTimeTrackerRepository(db),
     clock: systemClock,
     checkDatabase: () => checkDatabase(db),
