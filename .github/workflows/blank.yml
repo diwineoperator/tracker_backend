@@ -120,7 +120,7 @@ jobs:
           # Must be an absolute persistent directory, outside versioned releases.
           export UPLOAD_DIR=/var/lib/tracker/uploads
           mkdir -p "$UPLOAD_DIR"
-          npm ci --no-audit --no-fund
+          npm ci --include=dev --no-audit --no-fund
           npm run db:deploy
           npm run build
           test -f dist/server.js
