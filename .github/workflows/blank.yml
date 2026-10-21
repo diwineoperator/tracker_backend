@@ -75,6 +75,19 @@ jobs:
           ssh -o StrictHostKeyChecking=yes -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" \
             bash -s -- "$DEPLOY_PATH" "$GITHUB_SHA" "$PM2_NAME" <<'REMOTE'
           set -euo pipefail
+
+          export PATH="/home/ubuntu/.nvm/versions/node/v24.18.0/bin:$PATH"
+          hash -r
+      
+          echo "===== NODE ====="
+          node -v
+      
+          echo "===== NPM ====="
+          npm -v
+      
+          echo "===== PM2 ====="
+          pm2 -v
+
           DEPLOY_PATH="$1"; SHA="$2"; NAME="$3"
           RELEASE="$DEPLOY_PATH/releases/$SHA"
           cd "$RELEASE"
