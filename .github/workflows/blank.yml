@@ -197,6 +197,34 @@ jobs:
           fi
           pm2 save
           trap - ERR
+
+          # Retain at most 3 releases, protecting the active and rollback targets.
+          cleanup_releases() {
+            local active candidate path kept=0
+            local -a protected=() releases=()
+            active="$(readlink -f "$CURRENT" 2>/dev/null || true)"
+            is_valid_release "$active" || { echo 'Skipping cleanup: active release invalid' >&2; return 1; }
+            protected+=("$active")
+            if is_valid_release "$PREVIOUS" && [ "$PREVIOUS" != "$active" ]; then
+              protected+=("$PREVIOUS")
+            fi
+            # GNU find sort by modification time, newest first; no glob expansion or whitespace splitting.
+            while IFS= read -r -d '' path; do
+              releases+=("$path")
+            done < <(find "$DEPLOY_PATH/releases" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\0' | sort -zrn | cut -z -d ' ' -f 2-)
+            kept=${#protected[@]}
+            for path in "${releases[@]}"; do
+              [ "$path" = "$active" ] && continue
+              [ -n "$PREVIOUS" ] && [ "$path" = "$PREVIOUS" ] && continue
+              if [ "$kept" -lt 3 ]; then
+                kept=$((kept + 1))
+              else
+                echo "Removing old backend release: $path"
+                rm -rf -- "$path"
+              fi
+            done
+          }
+          cleanup_releases || echo 'Warning: backend release cleanup incomplete' >&2
           pm2 status
           echo "Backend deployment healthy: $SHA"
           REMOTE
