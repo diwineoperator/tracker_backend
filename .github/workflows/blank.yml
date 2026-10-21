@@ -22,6 +22,7 @@ jobs:
       PM2_NAME: tracker-backend
       DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
       DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+
     steps:
       - name: Checkout repository without marketplace actions
         env:
@@ -35,9 +36,9 @@ jobs:
       - name: Install Node 24.18.0
         run: |
           set -euo pipefail
-          curl -fsSLo /tmp/node.tar.xz https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-x64.tar.xz
+          curl -fsSLo "$RUNNER_TEMP/node.tar.xz" https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-x64.tar.xz
           mkdir -p "$RUNNER_TEMP/node"
-          tar -xJf /tmp/node.tar.xz -C "$RUNNER_TEMP/node" --strip-components=1
+          tar -xJf "$RUNNER_TEMP/node.tar.xz" -C "$RUNNER_TEMP/node" --strip-components=1
           echo "$RUNNER_TEMP/node/bin" >> "$GITHUB_PATH"
 
       - name: Package backend source
@@ -45,8 +46,8 @@ jobs:
           set -euo pipefail
           test -f package-lock.json
           tar --exclude=.git --exclude=.github --exclude=node_modules --exclude=dist \
-            --exclude=.env --exclude='.env.*' --exclude=uploads \
-            -czf /tmp/tracker-backend.tar.gz .
+              --exclude=.env --exclude='.env.*' --exclude=uploads \
+              -czf "$RUNNER_TEMP/tracker-backend.tar.gz" .
 
       - name: Configure verified SSH
         env:
@@ -66,7 +67,7 @@ jobs:
           set -euo pipefail
           ssh -o StrictHostKeyChecking=yes -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" \
             "mkdir -p '$DEPLOY_PATH/releases/$GITHUB_SHA'"
-          scp -o StrictHostKeyChecking=yes -i ~/.ssh/deploy_key /tmp/tracker-backend.tar.gz \
+          scp -o StrictHostKeyChecking=yes -i ~/.ssh/deploy_key "$RUNNER_TEMP/tracker-backend.tar.gz" \
             "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/releases/$GITHUB_SHA/source.tar.gz"
 
       - name: Build migrate and activate backend
@@ -75,39 +76,81 @@ jobs:
           ssh -o StrictHostKeyChecking=yes -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" \
             bash -s -- "$DEPLOY_PATH" "$GITHUB_SHA" "$PM2_NAME" <<'REMOTE'
           set -euo pipefail
-
           export PATH="/home/ubuntu/.nvm/versions/node/v24.18.0/bin:$PATH"
           hash -r
-      
-          echo "===== NODE ====="
-          node -v
-      
-          echo "===== NPM ====="
-          npm -v
-      
-          echo "===== PM2 ====="
-          pm2 -v
-
-          DEPLOY_PATH="$1"; SHA="$2"; NAME="$3"
-          RELEASE="$DEPLOY_PATH/releases/$SHA"
-          cd "$RELEASE"
-          tar -xzf source.tar.gz
-          rm source.tar.gz
-          # GitHub SSH runs a non-interactive shell; load NVM explicitly.
-          export NVM_DIR="$HOME/.nvm"
-          if [ -s "$NVM_DIR/nvm.sh" ]; then
-            . "$NVM_DIR/nvm.sh"
-            nvm use 24.18.0 >/dev/null
-          elif [ -x "$NVM_DIR/versions/node/v24.18.0/bin/node" ]; then
-            export PATH="$NVM_DIR/versions/node/v24.18.0/bin:$PATH"
-          else
-            echo 'Node.js 24.18.0 not found under NVM' >&2
-            exit 1
-          fi
           test "$(node -v)" = 'v24.18.0'
           command -v npm >/dev/null
           command -v pm2 >/dev/null
-          # Provision /etc/tracker/backend.env before first deployment.
+
+          DEPLOY_PATH="$1"
+          SHA="$2"
+          NAME="$3"
+          RELEASE="$DEPLOY_PATH/releases/$SHA"
+          CURRENT="$DEPLOY_PATH/current"
+          HEALTH_URL='http://127.0.0.1:5000/api/health'
+          PREVIOUS=''
+          ACTIVATED=0
+
+          is_valid_release() {
+            local candidate="$1"
+            [[ -n "$candidate" && "$candidate" == "$DEPLOY_PATH/releases/"* && -d "$candidate" && -f "$candidate/dist/server.js" ]]
+          }
+
+          switch_release() {
+            local target="$1"
+            is_valid_release "$target" || { echo "Invalid release: $target" >&2; return 1; }
+            local temporary="$DEPLOY_PATH/.current.$SHA.tmp"
+            rm -f -- "$temporary"
+            ln -s -- "$target" "$temporary"
+            mv -Tf -- "$temporary" "$CURRENT"
+            test "$(readlink -f "$CURRENT")" = "$target"
+          }
+
+          start_backend() {
+            local target="$1"
+            is_valid_release "$target" || return 1
+            if pm2 describe "$NAME" >/dev/null 2>&1; then
+              pm2 delete "$NAME"
+            fi
+            cd "$target"
+            pm2 start "$target/dist/server.js" --name "$NAME" --cwd "$target" --update-env
+          }
+
+          wait_for_health() {
+            local i
+            for i in $(seq 1 45); do
+              if curl -fsS --max-time 5 "$HEALTH_URL" >/dev/null 2>&1; then
+                echo 'Backend health check passed'
+                return 0
+              fi
+              sleep 2
+            done
+            return 1
+          }
+
+          rollback() {
+            local original_exit="$?"
+            trap - ERR
+            if [ "$ACTIVATED" -eq 1 ]; then
+              echo 'Activation failed; attempting application rollback' >&2
+              if is_valid_release "$PREVIOUS" && [ "$PREVIOUS" != "$RELEASE" ]; then
+                if switch_release "$PREVIOUS" && start_backend "$PREVIOUS" && wait_for_health; then
+                  pm2 save
+                  echo "Rollback succeeded: $PREVIOUS" >&2
+                else
+                  echo 'CRITICAL: Rollback failed or previous backend is unhealthy' >&2
+                  pm2 logs "$NAME" --lines 60 --nostream || true
+                fi
+              else
+                echo 'No valid previous release available; rollback impossible' >&2
+                pm2 logs "$NAME" --lines 60 --nostream || true
+              fi
+            fi
+            echo 'Database migrations are NOT automatically rolled back.' >&2
+            exit "$original_exit"
+          }
+
+          # Validate secrets and TLS configuration without printing their values.
           test -r /etc/tracker/backend.env
           set -a
           . /etc/tracker/backend.env
@@ -116,41 +159,44 @@ jobs:
           : "${ADMIN_USERNAME:?ADMIN_USERNAME missing}"
           : "${ADMIN_PASSWORD_HASH:?ADMIN_PASSWORD_HASH missing}"
           : "${JWT_SECRET:?JWT_SECRET missing}"
+          : "${NODE_EXTRA_CA_CERTS:?NODE_EXTRA_CA_CERTS missing}"
+          test -r "$NODE_EXTRA_CA_CERTS"
           export NODE_ENV=production PORT=5000
-          # Must be an absolute persistent directory, outside versioned releases.
           export UPLOAD_DIR=/var/lib/tracker/uploads
           mkdir -p "$UPLOAD_DIR"
+
+          # Resolve previous release before switching; never save 'current' itself.
+          candidate="$(readlink -f "$CURRENT" 2>/dev/null || true)"
+          if is_valid_release "$candidate"; then
+            PREVIOUS="$candidate"
+          elif [ -e "$CURRENT" ] || [ -L "$CURRENT" ]; then
+            echo 'Warning: current symlink is invalid; no rollback target available' >&2
+          fi
+
+          echo "Building release: $SHA"
+          cd "$RELEASE"
+          test -f source.tar.gz
+          tar -xzf source.tar.gz
+          rm -f source.tar.gz
           npm ci --include=dev --no-audit --no-fund
           npm run db:deploy
           npm run build
           test -f dist/server.js
           npm prune --omit=dev --no-audit --no-fund
-          PREVIOUS="$(readlink -f "$DEPLOY_PATH/current" || true)"
-          ln -sfn "$RELEASE" "$DEPLOY_PATH/current.next"
-          mv -Tf "$DEPLOY_PATH/current.next" "$DEPLOY_PATH/current"
-          # Recreate process so its working directory points to the new release.
-          if pm2 describe "$NAME" >/dev/null 2>&1; then pm2 delete "$NAME"; fi
-          cd "$DEPLOY_PATH/current"
-          pm2 start dist/server.js --name "$NAME" --cwd "$DEPLOY_PATH/current" --update-env
-          HEALTHY=0
-          for i in $(seq 1 45); do
-            if curl -fsS --max-time 5 http://127.0.0.1:5000/api/health >/dev/null; then HEALTHY=1; break; fi
-            sleep 2
-          done
-          if [ "$HEALTHY" -ne 1 ]; then
-            echo 'Backend health check failed; attempting application rollback' >&2
-            if [ -n "$PREVIOUS" ] && [ -d "$PREVIOUS" ]; then
-              ln -sfn "$PREVIOUS" "$DEPLOY_PATH/current.next"
-              mv -Tf "$DEPLOY_PATH/current.next" "$DEPLOY_PATH/current"
-              pm2 delete "$NAME" || true
-              cd "$DEPLOY_PATH/current"
-              pm2 start dist/server.js --name "$NAME" --cwd "$DEPLOY_PATH/current" --update-env || true
-            fi
-            echo 'Database migrations are NOT automatically rolled back.' >&2
-            pm2 logs "$NAME" --lines 100 --nostream || true
-            exit 1
+
+          # Re-check production runtime dependencies before touching live process.
+          test -f "$RELEASE/dist/server.js"
+          echo "Activating release: $RELEASE"
+          trap rollback ERR
+          ACTIVATED=1
+          switch_release "$RELEASE"
+          start_backend "$RELEASE"
+          if ! wait_for_health; then
+            echo 'Backend health check failed' >&2
+            false
           fi
           pm2 save
+          trap - ERR
           pm2 status
-          echo 'Backend deployment healthy'
+          echo "Backend deployment healthy: $SHA"
           REMOTE
