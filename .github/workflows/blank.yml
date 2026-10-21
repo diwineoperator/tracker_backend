@@ -1,0 +1,130 @@
+name: Deploy UAT Tracker Backend
+
+# on:
+#   workflow_dispatch:
+#   push:
+#     branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tracker-backend-uat
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: uat
+    timeout-minutes: 40
+    env:
+      DEPLOY_PATH: /var/www/tracker_backend
+      PM2_NAME: tracker-backend
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+    steps:
+      - name: Checkout repository without marketplace actions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git init
+          git -c http.extraheader="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)" fetch --depth 1 "https://github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_SHA"
+          git checkout --force FETCH_HEAD
+
+      - name: Install Node 24.18.0
+        run: |
+          set -euo pipefail
+          curl -fsSLo /tmp/node.tar.xz https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-x64.tar.xz
+          mkdir -p "$RUNNER_TEMP/node"
+          tar -xJf /tmp/node.tar.xz -C "$RUNNER_TEMP/node" --strip-components=1
+          echo "$RUNNER_TEMP/node/bin" >> "$GITHUB_PATH"
+
+      - name: Package backend source
+        run: |
+          set -euo pipefail
+          test -f package-lock.json
+          tar --exclude=.git --exclude=.github --exclude=node_modules --exclude=dist \
+            --exclude=.env --exclude='.env.*' --exclude=uploads \
+            -czf /tmp/tracker-backend.tar.gz .
+
+      - name: Configure verified SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          test -n "$DEPLOY_KNOWN_HOSTS"
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Upload backend source
+        run: |
+          set -euo pipefail
+          ssh -o StrictHostKeyChecking=yes -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" \
+            "mkdir -p '$DEPLOY_PATH/releases/$GITHUB_SHA'"
+          scp -o StrictHostKeyChecking=yes -i ~/.ssh/deploy_key /tmp/tracker-backend.tar.gz \
+            "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/releases/$GITHUB_SHA/source.tar.gz"
+
+      - name: Build migrate and activate backend
+        run: |
+          set -euo pipefail
+          ssh -o StrictHostKeyChecking=yes -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" \
+            bash -s -- "$DEPLOY_PATH" "$GITHUB_SHA" "$PM2_NAME" <<'REMOTE'
+          set -euo pipefail
+          DEPLOY_PATH="$1"; SHA="$2"; NAME="$3"
+          RELEASE="$DEPLOY_PATH/releases/$SHA"
+          cd "$RELEASE"
+          tar -xzf source.tar.gz
+          rm source.tar.gz
+          test "$(node -v)" = 'v24.18.0'
+          # Provision /etc/tracker/backend.env before first deployment.
+          test -r /etc/tracker/backend.env
+          set -a
+          . /etc/tracker/backend.env
+          set +a
+          : "${DATABASE_URL:?DATABASE_URL missing}"
+          : "${ADMIN_USERNAME:?ADMIN_USERNAME missing}"
+          : "${ADMIN_PASSWORD_HASH:?ADMIN_PASSWORD_HASH missing}"
+          : "${JWT_SECRET:?JWT_SECRET missing}"
+          export NODE_ENV=production PORT=5000
+          # Must be an absolute persistent directory, outside versioned releases.
+          export UPLOAD_DIR=/var/lib/tracker/uploads
+          mkdir -p "$UPLOAD_DIR"
+          npm ci --no-audit --no-fund
+          npm run db:deploy
+          npm run build
+          test -f dist/server.js
+          npm prune --omit=dev --no-audit --no-fund
+          PREVIOUS="$(readlink -f "$DEPLOY_PATH/current" || true)"
+          ln -sfn "$RELEASE" "$DEPLOY_PATH/current.next"
+          mv -Tf "$DEPLOY_PATH/current.next" "$DEPLOY_PATH/current"
+          # Recreate process so its working directory points to the new release.
+          if pm2 describe "$NAME" >/dev/null 2>&1; then pm2 delete "$NAME"; fi
+          cd "$DEPLOY_PATH/current"
+          pm2 start dist/server.js --name "$NAME" --cwd "$DEPLOY_PATH/current" --update-env
+          HEALTHY=0
+          for i in $(seq 1 45); do
+            if curl -fsS --max-time 5 http://127.0.0.1:5000/api/health >/dev/null; then HEALTHY=1; break; fi
+            sleep 2
+          done
+          if [ "$HEALTHY" -ne 1 ]; then
+            echo 'Backend health check failed; attempting application rollback' >&2
+            if [ -n "$PREVIOUS" ] && [ -d "$PREVIOUS" ]; then
+              ln -sfn "$PREVIOUS" "$DEPLOY_PATH/current.next"
+              mv -Tf "$DEPLOY_PATH/current.next" "$DEPLOY_PATH/current"
+              pm2 delete "$NAME" || true
+              cd "$DEPLOY_PATH/current"
+              pm2 start dist/server.js --name "$NAME" --cwd "$DEPLOY_PATH/current" --update-env || true
+            fi
+            echo 'Database migrations are NOT automatically rolled back.' >&2
+            pm2 logs "$NAME" --lines 100 --nostream || true
+            exit 1
+          fi
+          pm2 save
+          pm2 status
+          echo 'Backend deployment healthy'
+          REMOTE
